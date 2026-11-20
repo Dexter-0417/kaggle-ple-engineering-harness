@@ -29,10 +29,13 @@ for Claude, GLM, GPT-6 and DeepSeek-V4, `high` for other models).
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import os
 import posixpath
 import re
+import struct
 import sys
 import time
 import types
@@ -73,6 +76,74 @@ FINISH_MARGIN_SEC = 180
 MCP_INIT_TOTAL_SEC = 120
 MCP_INIT_ATTEMPT_SEC = 30
 MCP_INIT_WAITS = (1, 3)  # short retries for transient startup failures
+
+# A tool-heavy solver can spend its entire window exploring input drawings
+# without writing the graded deliverable. Prompt progress milestones while
+# leaving the task deadline, tools, and engineering correctness unchanged.
+OUTPUT_CHECKPOINT_STEPS = (8, 16, 24, 32)
+MAX_IMAGE_BYTES = 3 * 1024 * 1024
+MAX_IMAGE_PIXELS = 20_000_000
+MAX_IMAGE_EDGE = 8192
+MAX_TOTAL_IMAGE_BYTES = 12 * 1024 * 1024
+
+
+def jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
+  """Find JPEG SOF dimensions without importing an image decoder.
+
+  Rejects files that have no supported SOF frame before the image scan.
+  """
+  if not data.startswith(b"\xff\xd8"):
+    return None
+  at = 2
+  sof = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+         0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+  while at < len(data) - 1:
+    if data[at] != 0xFF:
+      return None
+    at += 1
+    while at < len(data) and data[at] == 0xFF:
+      at += 1
+    if at >= len(data):
+      return None
+    marker = data[at]
+    at += 1
+    if marker in (0xD8, 0xD9, 0x01) or 0xD0 <= marker <= 0xD7:
+      continue
+    if marker == 0xDA or at + 2 > len(data):
+      return None
+    size = int.from_bytes(data[at:at + 2], "big")
+    if size < 2 or at + size > len(data):
+      return None
+    if marker in sof:
+      if size < 7:
+        return None
+      height = int.from_bytes(data[at + 3:at + 5], "big")
+      width = int.from_bytes(data[at + 5:at + 7], "big")
+      return width, height
+    at += size
+  return None
+
+
+def output_checkpoint(turns: int) -> str | None:
+  """Return a generic deliverable checkpoint at sparse tool-use milestones.
+
+  No task paths, answers, or rubric contents are hardcoded here.
+  """
+  if turns not in OUTPUT_CHECKPOINT_STEPS and not (
+      turns > 32 and turns % 16 == 0
+  ):
+    return None
+  return (
+      f"OUTPUT CHECKPOINT after {turns} tool calls. Review the exact output "
+      "file(s) and paths required by the task. Before further exploratory "
+      "analysis, create or materially update a valid task-specific "
+      "deliverable at those paths and use verify_file to check structure. "
+      "If the task has drawings, prioritize information needed for a first "
+      "working deliverable instead of long custom OCR experiments. "
+      "Continue refining after a concrete output exists. Never invent "
+      "engineering facts or claim that structural validation proves "
+      "engineering correctness."
+  )
 RETRY_WAITS = (5, 15, 30, 60, 120)
 # How endpoints word an error saying the conversation no longer fits (xAI's:
 # "maximum prompt length is N but the request contains M tokens"). OpenAI's
@@ -141,6 +212,7 @@ starts in {workdir}), read_file, write_file and edit_file. The container has no 
 
 How to work:
 - Read the whole task, then look at the files you were given before choosing an approach.
+- For PNG/JPEG engineering drawings, call view_image to inspect the actual image visually before coding OCR from scratch. If labels are small, use simple task-container cropping or enlargement with available tools and call view_image again. Never invent unreadable dimensions.
 - Work in small, verified steps. Compute numbers with code rather than by hand, and check units.
 - Before optimizing, enumerate every hard safety and feasibility constraint from the supplied task; keep an explicit pass/fail checklist.
 - Independently recompute numerical claims using a second method or tool when feasible; validate dimensions, sign conventions, and units.
@@ -219,6 +291,17 @@ TOOLS = [
     tool(
         "read_file",
         "Read a text file from the task container.",
+        ["path"],
+        path={"type": "string"},
+    ),
+    tool(
+        "view_image",
+        "READ-ONLY VISUAL INPUT: show a PNG or JPEG drawing/image from the "
+        "task container to the vision-capable AI model. Use this tool to "
+        "inspect plan sheets, diagrams and labels directly BEFORE attempting "
+        "custom OCR or text-only pixel analysis. Returns a short status and "
+        "adds the image to the next model turn. Limit 4 MiB per image. "
+        "Inspect several sheets in separate calls if necessary.",
         ["path"],
         path={"type": "string"},
     ),
@@ -568,6 +651,15 @@ def marked(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
               "cache_control": {"type": "ephemeral"},
           }],
       }
+    elif isinstance(content, list):
+      # A Claude cache breakpoint belongs on a content block, never the
+      # multimodal message. Preserve original image and text parts by copy.
+      copied = [dict(part) for part in content]
+      for part in reversed(copied):
+        if part.get("type") == "text":
+          part["cache_control"] = {"type": "ephemeral"}
+          break
+      out[i] = {**m, "content": copied}
     else:
       out[i] = {**m, "cache_control": {"type": "ephemeral"}}
   return out
@@ -596,7 +688,22 @@ def response_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
           "output": m["content"],
       })
     elif m["role"] != "assistant":
-      items.append({"role": m["role"], "content": m["content"]})
+      content = m["content"]
+      if isinstance(content, list):
+        # Responses API uses input_image/image_url instead of Chat
+        # Completions image_url blocks. Keep unmodified text content.
+        content = [
+            {
+                "type": "input_image",
+                "image_url": part["image_url"]["url"],
+                "detail": part["image_url"].get("detail", "auto"),
+            }
+            if part.get("type") == "image_url" else
+            {"type": "input_text", "text": part["text"]}
+            if part.get("type") == "text" else part
+            for part in content
+        ]
+      items.append({"role": m["role"], "content": content})
     elif "output_items" in m:
       calls = iter(m.get("tool_calls") or [])
       for item in m["output_items"]:
@@ -911,6 +1018,10 @@ class Agent:
     # whether calls go to the Responses API rather than Chat Completions
     self.responses = MODEL.lower().startswith(RESPONSES_MODELS)
     self.finish_margin = FINISH_MARGIN_SEC
+    self.tool_turns = 0
+    self.pending_images: list[dict[str, Any]] = []
+    self.seen_images: set[str] = set()
+    self.image_bytes = 0
 
   async def run(self) -> str:
     """Runs the agent tool-calling loop until the task is complete.
@@ -1015,6 +1126,18 @@ class Agent:
       left = self.session.time_left()
       if left is not None:
         self.messages[-1]["content"] += f"\n[{int(left // 60)} minutes left]"
+      # Attach image in the next user turn AFTER replying to the tool call.
+      # This ensures each assistant function_call still has its tool result.
+      if self.pending_images:
+        self.messages.extend(self.pending_images)
+        self.pending_images.clear()
+      previous_turns = self.tool_turns
+      self.tool_turns += len(reply.calls)
+      # Handle batched function calls that cross a checkpoint in one reply.
+      for milestone in range(previous_turns + 1, self.tool_turns + 1):
+        note = output_checkpoint(milestone)
+        if note:
+          self.messages.append({"role": "user", "content": note})
       if self.prompt_tokens > self.compact_at():
         await self.compact()
 
@@ -1027,6 +1150,7 @@ class Agent:
     Returns:
       The final summary text, falling back to `self.session.final_message`.
     """
+    self.drop_images()
     self.messages.append({
         "role": "user",
         "content": (
@@ -1336,7 +1460,43 @@ class Agent:
         or self.use_max_tokens(error)
         or self.drop_effort(error)
         or self.shrink_output(error)
+        or self.drop_images()
     )
+
+  def drop_images(self) -> bool:
+    """Remove unsupported image blocks after an endpoint rejects a request.
+
+    Without cleanup a permanent 400 would recur during the final summary.
+    Inform the model that text-only inspection remains available.
+    """
+    removed = False
+    for i, message in enumerate(self.messages):
+      parts = message.get("content")
+      if not isinstance(parts, list):
+        continue
+      if not any(part.get("type") in ("image_url", "input_image")
+                 for part in parts if isinstance(part, dict)):
+        continue
+      text = " ".join(
+          str(part.get("text", "")) for part in parts
+          if isinstance(part, dict) and part.get("type") == "text"
+      )
+      self.messages[i] = {
+          **message, "content": (
+              text + "\n[Image unavailable to this model endpoint; use "
+              "task tools to inspect the underlying file instead.]"
+          ),
+      }
+      removed = True
+    if removed:
+      self.pending_images.clear()
+      self.seen_images.clear()
+      self.image_bytes = 0
+      self.tools = [
+          t for t in self.tools
+          if t.get("function", {}).get("name") != "view_image"
+      ]
+    return removed
 
   def use_responses(self, error: str) -> bool:
     """Switches to the Responses API if a Chat Completions 400 points there.
@@ -1488,13 +1648,24 @@ class Agent:
     Returns:
       Estimated number of tokens in `self.messages`.
     """
-    return (
-        sum(
-            len(json.dumps({k: v for k, v in m.items() if k != "output_items"}))
-            for m in self.messages
-        )
-        // 4
-    )
+    total = 0
+    for m in self.messages:
+      parts = m.get("content")
+      if isinstance(parts, list):
+        header = {k: v for k, v in m.items()
+                  if k not in ("content", "output_items")}
+        total += len(json.dumps(header)) // 4
+        for part in parts:
+          if (isinstance(part, dict)
+              and part.get("type") in ("image_url", "input_image")):
+            total += 1500  # image tokens depend on tiles, not base64 length
+          else:
+            total += len(json.dumps(part)) // 4
+      else:
+        total += len(json.dumps(
+            {k: v for k, v in m.items() if k != "output_items"
+            })) // 4
+    return total
 
   async def stream(
       self,
@@ -1698,7 +1869,7 @@ class Agent:
     # Never log arguments: a tool's parameters could contain private/hidden
     # task instructions, source quotations, or document contents.
     permitted = {
-        "bash", "read_file", "write_file", "edit_file", "verify_file",
+        "bash", "read_file", "view_image", "write_file", "edit_file", "verify_file",
         "suggest_constraints", "check_constraint", "mcp_find", "mcp_call",
     }
     safe_tool_name = (
@@ -1784,6 +1955,7 @@ class Agent:
       handler = {
           "bash": self.bash,
           "read_file": self.read_file,
+          "view_image": self.view_image,
           "verify_file": self.verify_file,
           "write_file": self.write_file,
           "edit_file": self.edit_file,
@@ -1866,6 +2038,73 @@ class Agent:
           " (python3, unzip -l, ...)"
       )
     return data.decode("utf-8", "replace") or "(empty file)"
+
+  async def view_image(self, path: str) -> str:
+    """Attach one checked task-local image to the next model request.
+
+    Uses the evaluator's existing read_file RPC: no HTTP egress and no host
+    filesystem access. Refuses oversized, invalid or non-image bytes.
+    """
+    left = self.session.time_left()
+    if left is not None and left <= self.finish_margin + 20:
+      return "error: too close to deadline for visual inspection"
+    data = await self.session.read_file(self.path(path))
+    if not 0 < len(data) <= MAX_IMAGE_BYTES:
+      return f"error: image must be 1 to {MAX_IMAGE_BYTES} bytes"
+    mime = None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+      if (
+          len(data) < 45
+          or data[8:16] != b"\x00\x00\x00\x0dIHDR"
+          or not data.endswith(b"\x00\x00\x00\x00IEND\xaeB\x60\x82")
+      ):
+        return "error: incomplete PNG image structure"
+      width, height = struct.unpack(">II", data[16:24])
+      if (width == 0 or height == 0 or
+          width > MAX_IMAGE_EDGE or height > MAX_IMAGE_EDGE or
+          width * height > MAX_IMAGE_PIXELS):
+        return "error: invalid or too-large PNG dimensions"
+      mime = "image/png"
+    elif data.startswith(b"\xff\xd8\xff") and b"\xff\xd9" in data[-64:]:
+      dimensions = jpeg_dimensions(data)
+      if dimensions is None:
+        return "error: missing or malformed JPEG dimensions"
+      width, height = dimensions
+      if (width == 0 or height == 0 or
+          width > MAX_IMAGE_EDGE or height > MAX_IMAGE_EDGE or
+          width * height > MAX_IMAGE_PIXELS):
+        return "error: invalid or too-large JPEG dimensions"
+      mime = "image/jpeg"
+    if mime is None:
+      return "error: not a PNG or JPEG file; convert using bash if needed"
+    digest = hashlib.sha256(data).hexdigest()
+    if digest in self.seen_images:
+      return f"already attached image from {path}; review the earlier vision turn"
+    if self.image_bytes + len(data) > MAX_TOTAL_IMAGE_BYTES:
+      return "error: task image attachment budget exceeded"
+    self.seen_images.add(digest)
+    self.image_bytes += len(data)
+    # Source path describes the user's supplied task file, not an external URL.
+    # The model request uses the provider's native multimodal data URI.
+    self.pending_images.append({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": (
+                f"Visually inspect the task drawing at {path!r}. "
+                "Read spatial layout, annotations, and measurements directly. "
+                "If small text is not legible, say so rather than inventing it."
+            )},
+            {"type": "image_url", "image_url": {
+                "url": "data:" + mime + ";base64,"
+                       + base64.b64encode(data).decode("ascii"),
+                "detail": "high",
+            }},
+        ],
+    })
+    return (
+        f"image attached for the next model turn: {path} "
+        f"({mime}, {len(data)} bytes); interpret it visually"
+    )
 
   async def verify_file(self, path: str, file_format: str = "auto") -> str:
     """Read-only structural check for a deliverable in the task container.

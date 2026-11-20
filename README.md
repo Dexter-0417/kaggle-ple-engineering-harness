@@ -26,8 +26,10 @@ This is an independent fork of Google's Apache-2.0 google-research/ple sample_su
 - MCP **tool calls** respect the final-summary reserve and warn that a timed-out request may already have applied remote changes.
 - Model endpoint errors trigger an attempt to produce a final answer rather than failing without deliverables.
 - Truncated shell-command output is explicitly flagged so the agent does not mistake partial results for complete data.
+- After 8, 16, 24 and later spaced tool calls, the agent receives an output checkpoint. This is intended to prevent long exploratory digressions (such as custom OCR of supplied drawings) from exhausting the task time without creating a deliverable. The checkpoints do not invent solutions or change the evaluator's score.
 - The read-only `verify_file` tool checks task deliverables before completion: missing/empty files, basic JSON/CSV/ZIP/Office/PDF/Python/XML/IFC structural validity. It cannot validate engineering calculations or guarantee a benchmark score.
 - The file probe uses isolated Python with safely quoted paths, handles noisy evaluator output, and rejects symlinked outputs according to the competition artifact rules.
+- The read-only `view_image` tool sends task-local PNG/JPEG drawings to image-capable model endpoints as native multimodal input, rather than spending the task's entire time on handwritten OCR. File-size, dimensions, format, and repeated-image budgets are checked before attaching; if an endpoint refuses images, the harness falls back to text-only tools instead of repeatedly failing. This vision feature has passed synthetic tests, **not yet real MEP benchmark grading**.
 
 These are engineering changes; none has been shown to improve the official dev benchmark score yet.
 
