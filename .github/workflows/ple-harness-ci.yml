@@ -1,0 +1,67 @@
+name: PLE harness offline validation
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ple-offline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-test-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout own harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Checkout official competition kit
+        uses: actions/checkout@v4
+        with:
+          repository: google-research/ple
+          ref: 8320f0402fdca9f42476607f72bcfd521cd50c9
+          path: ple-official
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Offline Python dependencies
+        run: |
+          cd harness
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -r requirements.txt
+
+      - name: Unit tests with fake evaluator and synthetic files
+        run: |
+          cd harness
+          .venv/bin/python -m unittest discover -s tests -p 'test_*.py' -q
+          .venv/bin/python -m py_compile serve.py taskbridge.py
+
+      - name: Google PLE submission schema
+        run: |
+          cd ple-official
+          uv run python -m kit validate ../harness
+
+      - name: Build PLE harness image (no model requests)
+        run: |
+          cd ple-official
+          uv run python -m kit build ../harness
+
+      - name: Runner resources
+        if: always()
+        run: |
+          echo 'This workflow is OFFLINE only; it does not score dev tasks.'
+          nproc
+          free -h
+          df -h .
