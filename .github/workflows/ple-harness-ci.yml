@@ -1,0 +1,27 @@
+name: PLE harness offline validation
+on: [push, workflow_dispatch]
+permissions: {contents: read}
+jobs:
+  offline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: google-research/ple
+          path: ple-official
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+      - name: Offline tests, official validation and Docker build
+        run: |
+          cd harness
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -r requirements.txt
+          .venv/bin/python -m unittest discover -s tests -p 'test_*.py' -q
+          cd ../ple-official
+          uv run python -m kit validate ../harness
+          uv run python -m kit build ../harness
