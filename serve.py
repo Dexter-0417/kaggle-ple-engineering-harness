@@ -87,6 +87,7 @@ MAX_IMAGE_BYTES = 3 * 1024 * 1024
 MAX_IMAGE_PIXELS = 20_000_000
 MAX_IMAGE_EDGE = 8192
 MAX_TOTAL_IMAGE_BYTES = 12 * 1024 * 1024
+MAX_IMAGE_READ_SECONDS = 30.0
 
 
 def jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
@@ -2061,7 +2062,24 @@ class Agent:
     left = self.session.time_left()
     if left is not None and left <= self.finish_margin + 20:
       return "error: too close to deadline for visual inspection"
-    data = await self.session.read_file(self.path(path))
+    # A task evaluator that never answers a read_file RPC must not stall the
+    # entire engineering run. The taskbridge future is cancelled/removed by
+    # asyncio.wait_for, leaving time for alternative inspection and output.
+    budget = (
+        MAX_IMAGE_READ_SECONDS if left is None
+        else max(1.0, min(
+            MAX_IMAGE_READ_SECONDS, left - self.finish_margin - 15.0
+        ))
+    )
+    try:
+      data = await asyncio.wait_for(
+          self.session.read_file(self.path(path)), timeout=budget
+      )
+    except asyncio.TimeoutError:
+      return (
+          f"error: image read timed out after {budget:.0f}s at {path}; "
+          "continue from available drawings or use another task tool"
+      )
     if not 0 < len(data) <= MAX_IMAGE_BYTES:
       return f"error: image must be 1 to {MAX_IMAGE_BYTES} bytes"
     mime = None

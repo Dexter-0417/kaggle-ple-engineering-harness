@@ -187,6 +187,21 @@ class ViewImageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("too-large PNG dimensions", out)
         self.assertFalse(agent.pending_images)
 
+    async def test_unresponsive_task_image_rpc_times_out_and_recovers(self):
+        class HungSession(Session):
+            async def read_file(self, path):
+                self.read_calls.append(path)
+                await asyncio.sleep(120)
+                return png()
+        session = HungSession()
+        agent = Agent(session)
+        with patch.object(serve, "MAX_IMAGE_READ_SECONDS", 0.02):
+            response = await agent.view_image("input/plan.png")
+        self.assertIn("read timed out", response)
+        self.assertIn("another task tool", response)
+        self.assertFalse(agent.pending_images)
+        self.assertEqual(len(session.read_calls), 1)
+
     async def test_too_close_to_deadline_never_reads(self):
         session = Session(remaining=1)
         agent = Agent(session)
