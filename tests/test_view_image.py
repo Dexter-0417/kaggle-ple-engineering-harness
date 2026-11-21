@@ -75,8 +75,8 @@ class ViewImageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent.pending_images), 1)
         msg = agent.pending_images[0]
         self.assertEqual(msg["role"], "user")
-        self.assertEqual(msg["content"][0]["type"], "text")
-        media = msg["content"][1]
+        self.assertEqual(msg["content"][1]["type"], "text")
+        media = msg["content"][0]
         self.assertEqual(media["type"], "image_url")
         self.assertEqual(media["image_url"]["detail"], "high")
         prefix, encoded = media["image_url"]["url"].split(",", 1)
@@ -88,7 +88,7 @@ class ViewImageTests(unittest.IsolatedAsyncioTestCase):
         agent = Agent(Session({"/app/figure.jpg": jpeg()}))
         out = await agent.view_image("figure.jpg")
         self.assertIn("image/jpeg", out)
-        self.assertIn("image/jpeg", agent.pending_images[0]["content"][1]["image_url"]["url"])
+        self.assertIn("image/jpeg", agent.pending_images[0]["content"][0]["image_url"]["url"])
 
     async def test_jpeg_invalid_dimensions_rejected(self):
         agent = Agent(Session({"/app/oversized.jpg": jpeg(10000, 8)}))
@@ -103,6 +103,58 @@ class ViewImageTests(unittest.IsolatedAsyncioTestCase):
     async def test_jpeg_with_trailing_metadata_accepted(self):
         agent = Agent(Session({"/app/meta.jpg": jpeg() + b"\x00\x00"}))
         self.assertIn("image/jpeg", await agent.view_image("meta.jpg"))
+
+    async def test_cropped_png_magnifies_and_preserves_pixel_color(self):
+        from PIL import Image
+        from io import BytesIO
+        agent = Agent(Session())
+        response = await agent.view_image(
+            "input/plan.png", crop=[1, 1, 7, 7], scale=3
+        )
+        self.assertIn("crop=[1, 1, 7, 7]", response)
+        encoded = agent.pending_images[0]["content"][0]["image_url"]["url"].split(",")[1]
+        with Image.open(BytesIO(base64.b64decode(encoded))) as image:
+            self.assertEqual(image.size, (18, 18))
+            self.assertEqual(image.convert("RGB").getpixel((9, 9)), (255, 0, 0))
+
+    async def test_invalid_crop_never_attaches(self):
+        agent = Agent(Session())
+        for crop in ([0, 0, 900, 900], [-1, 1, 5, 5],
+                     [4, 4, 2, 7], [True, 0, 4, 4]):
+            with self.subTest(crop=crop):
+                self.assertIn("error:", await agent.view_image(
+                    "input/plan.png", crop=crop, scale=2
+                ))
+        self.assertEqual(agent.pending_images, [])
+
+    async def test_repeated_same_crop_avoids_duplicate(self):
+        agent = Agent(Session())
+        self.assertIn("image attached", await agent.view_image(
+            "input/plan.png", crop=[0, 0, 5, 5], scale=2
+        ))
+        self.assertIn("already attached", await agent.view_image(
+            "input/plan.png", crop=[0, 0, 5, 5], scale=2
+        ))
+        self.assertEqual(len(agent.pending_images), 1)
+
+    async def test_scale_without_crop_is_rejected(self):
+        agent = Agent(Session())
+        result = await agent.view_image("input/plan.png", scale=2)
+        self.assertIn("crop must be", result)
+        self.assertFalse(agent.pending_images)
+
+    async def test_crop_of_actual_jpeg_decodes_to_png(self):
+        from PIL import Image
+        from io import BytesIO
+        jpeg = BytesIO()
+        Image.new("RGB", (32, 16), (0, 20, 250)).save(jpeg, format="JPEG")
+        agent = Agent(Session({"/app/chart.jpg": jpeg.getvalue()}))
+        result = await agent.view_image(
+            "chart.jpg", crop=[4, 3, 28, 14], scale=2
+        )
+        self.assertIn("image/png", result)
+        uri = agent.pending_images[0]["content"][0]["image_url"]["url"]
+        self.assertTrue(uri.startswith("data:image/png;base64,"))
 
     async def test_near_deadline_rejects_image_with_summary_margin(self):
         session = Session(remaining=170)
@@ -149,16 +201,16 @@ class ViewImageTests(unittest.IsolatedAsyncioTestCase):
         messages = [{"role": "system", "content": "SYSTEM"}, msg]
         with patch.object(serve, "CACHE_MARK", True):
             cache = marked(messages)
-        self.assertEqual(cache[1]["content"][1]["type"], "image_url")
+        self.assertEqual(cache[1]["content"][0]["type"], "image_url")
         self.assertEqual(
-            cache[1]["content"][0]["cache_control"], {"type": "ephemeral"}
+            cache[1]["content"][1]["cache_control"], {"type": "ephemeral"}
         )
-        self.assertNotIn("cache_control", messages[1]["content"][0])
+        self.assertNotIn("cache_control", messages[1]["content"][1])
         response = response_input(messages)
-        self.assertEqual(response[1]["content"][0]["type"], "input_text")
-        self.assertEqual(response[1]["content"][1]["type"], "input_image")
-        self.assertEqual(response[1]["content"][1]["detail"], "high")
-        self.assertTrue(response[1]["content"][1]["image_url"].startswith("data:image/png;base64,"))
+        self.assertEqual(response[1]["content"][0]["type"], "input_image")
+        self.assertEqual(response[1]["content"][1]["type"], "input_text")
+        self.assertEqual(response[1]["content"][0]["detail"], "high")
+        self.assertTrue(response[1]["content"][0]["image_url"].startswith("data:image/png;base64,"))
 
     async def test_duplicate_image_is_not_appended_twice(self):
         agent = Agent(Session())

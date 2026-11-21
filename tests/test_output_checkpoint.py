@@ -8,8 +8,9 @@ class CheckpointPolicyTests(unittest.TestCase):
     def test_first_checkpoint_before_long_tool_detour(self):
         self.assertIsNone(output_checkpoint(7))
         text = output_checkpoint(8)
-        self.assertIn("required by the task", text)
-        self.assertIn("create or materially update", text)
+        self.assertIn("task's required entities", text)
+        self.assertIn("implement a first substantive", text)
+        self.assertIn("empty format-valid scaffold", text)
         self.assertIn("verify_file", text)
 
     def test_checkpoints_are_sparse_and_deterministic(self):
@@ -22,8 +23,8 @@ class CheckpointPolicyTests(unittest.TestCase):
         self.assertNotIn("data-hall-mep-routing", note)
         self.assertNotIn("model.ifc", note)
         self.assertNotIn("solution.py", note)
-        self.assertIn("Never invent", note)
-        self.assertIn("engineering correctness", note)
+        self.assertIn("Never fabricate", note)
+        self.assertIn("engineering compliance", note)
 
     def test_zero_and_small_task_no_extra_prompt(self):
         for i in (0, 1, 2, 3, 6, 9):

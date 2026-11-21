@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import os
 import posixpath
@@ -42,6 +43,7 @@ import types
 from typing import Any
 
 import openai
+from PIL import Image, UnidentifiedImageError
 import taskbridge
 import file_validation
 import constraint_check
@@ -134,15 +136,16 @@ def output_checkpoint(turns: int) -> str | None:
   ):
     return None
   return (
-      f"OUTPUT CHECKPOINT after {turns} tool calls. Review the exact output "
-      "file(s) and paths required by the task. Before further exploratory "
-      "analysis, create or materially update a valid task-specific "
-      "deliverable at those paths and use verify_file to check structure. "
-      "If the task has drawings, prioritize information needed for a first "
-      "working deliverable instead of long custom OCR experiments. "
-      "Continue refining after a concrete output exists. Never invent "
-      "engineering facts or claim that structural validation proves "
-      "engineering correctness."
+      f"OUTPUT CHECKPOINT after {turns} tool calls. For EVERY requested "
+      "graded output, compare the current output against the task's required "
+      "entities and acceptance gates. An empty format-valid scaffold or "
+      "a generic example does NOT satisfy the task. Stop discretionary "
+      "research and implement a first substantive working deliverable NOW; "
+      "execute it and use verify_file for format checks. Where critical "
+      "drawing notes are illegible, use view_image with crop+scale instead "
+      "of writing a custom OCR engine. Revisit optional optimization only "
+      "after real required content exists. Never fabricate source facts, "
+      "engineering compliance, or validation results."
   )
 RETRY_WAITS = (5, 15, 30, 60, 120)
 # How endpoints word an error saying the conversation no longer fits (xAI's:
@@ -211,8 +214,11 @@ SYSTEM = """You are an expert engineer working on a task in a Linux container. Y
 starts in {workdir}), read_file, write_file and edit_file. The container has no internet access.{mcp}
 
 How to work:
-- Read the whole task, then look at the files you were given before choosing an approach.
-- For PNG/JPEG engineering drawings, call view_image to inspect the actual image visually before coding OCR from scratch. If labels are small, use simple task-container cropping or enlargement with available tools and call view_image again. Never invent unreadable dimensions.
+- Read the whole task and identify ALL required deliverable paths, formats, mandatory entity categories, and hard validation gates before choosing an approach.
+- Build the first executable substantive version of every graded deliverable early, rather than writing only an empty valid-format stub and deferring actual required geometry/elements to the end. An empty IFC site, empty spreadsheet or header-only script is NOT a useful first pass.
+- For PNG/JPEG engineering drawings, use view_image before writing a custom OCR pipeline. Review every critical sheet needed for the required deliverable, including safety, fire, electrical and mechanical plans; do not repeatedly inspect minor crops before covering required input sheets.
+- If dimensions or annotations are illegible, call view_image with pixel crop=[left, top, right, bottom], scale=2 or 3. The harness magnifies it without modifying source data. Do not invent unreadable dimensions.
+- Timebox discovery. Once you know output schema and enough constraints, create and run the actual deliverable-generation code; use later time to validate/refine. Prioritize hard-gate completeness over optional optimization or extensive exploratory scripts.
 - Work in small, verified steps. Compute numbers with code rather than by hand, and check units.
 - Before optimizing, enumerate every hard safety and feasibility constraint from the supplied task; keep an explicit pass/fail checklist.
 - Independently recompute numerical claims using a second method or tool when feasible; validate dimensions, sign conventions, and units.
@@ -300,10 +306,15 @@ TOOLS = [
         "task container to the vision-capable AI model. Use this tool to "
         "inspect plan sheets, diagrams and labels directly BEFORE attempting "
         "custom OCR or text-only pixel analysis. Returns a short status and "
-        "adds the image to the next model turn. Limit 4 MiB per image. "
-        "Inspect several sheets in separate calls if necessary.",
+        "adds the image to the next model turn. Limit 3 MiB per image. "
+        "To magnify illegible drawing labels, supply an optional pixel crop "
+        "[left, top, right, bottom] and scale=2 or 3. This crop is performed "
+        "inside the harness without writing temporary task files.",
         ["path"],
         path={"type": "string"},
+        crop={"type": "array", "items": {"type": "integer"},
+              "minItems": 4, "maxItems": 4},
+        scale={"type": "integer", "enum": [1, 2, 3]},
     ),
     tool(
         "suggest_constraints",
@@ -2039,7 +2050,9 @@ class Agent:
       )
     return data.decode("utf-8", "replace") or "(empty file)"
 
-  async def view_image(self, path: str) -> str:
+  async def view_image(
+      self, path: str, crop: list[int] | None = None, scale: int = 1
+  ) -> str:
     """Attach one checked task-local image to the next model request.
 
     Uses the evaluator's existing read_file RPC: no HTTP egress and no host
@@ -2077,6 +2090,42 @@ class Agent:
       mime = "image/jpeg"
     if mime is None:
       return "error: not a PNG or JPEG file; convert using bash if needed"
+    crop_label = ""
+    if crop is not None or scale != 1:
+      if (
+          not isinstance(crop, list)
+          or len(crop) != 4
+          or any(not isinstance(v, int) or isinstance(v, bool) for v in crop)
+          or not isinstance(scale, int)
+          or isinstance(scale, bool)
+          or scale not in (1, 2, 3)
+      ):
+        return "error: crop must be 4 integer pixel bounds, scale 1 to 3"
+      left, top, right, bottom = crop
+      if not (0 <= left < right <= width and 0 <= top < bottom <= height):
+        return "error: image crop is outside its source bounds"
+      out_w, out_h = (right - left) * scale, (bottom - top) * scale
+      if (out_w > 4096 or out_h > 4096 or
+          out_w * out_h > MAX_IMAGE_PIXELS):
+        return "error: cropped image dimensions are too large"
+      try:
+        with Image.open(io.BytesIO(data)) as image:
+          image.load()
+          cropped = image.crop((left, top, right, bottom))
+          if scale != 1:
+            cropped = cropped.resize(
+                (out_w, out_h), Image.Resampling.LANCZOS
+            )
+          buf = io.BytesIO()
+          cropped.save(buf, format="PNG", optimize=True)
+          data = buf.getvalue()
+      except (OSError, ValueError, UnidentifiedImageError,
+              Image.DecompressionBombError):
+        return "error: could not decode/crop the supplied image"
+      if len(data) > MAX_IMAGE_BYTES:
+        return "error: encoded image crop is too large"
+      mime = "image/png"
+      crop_label = f", crop={crop}, scale={scale}"
     digest = hashlib.sha256(data).hexdigest()
     if digest in self.seen_images:
       return f"already attached image from {path}; review the earlier vision turn"
@@ -2089,21 +2138,23 @@ class Agent:
     self.pending_images.append({
         "role": "user",
         "content": [
-            {"type": "text", "text": (
-                f"Visually inspect the task drawing at {path!r}. "
-                "Read spatial layout, annotations, and measurements directly. "
-                "If small text is not legible, say so rather than inventing it."
-            )},
             {"type": "image_url", "image_url": {
                 "url": "data:" + mime + ";base64,"
                        + base64.b64encode(data).decode("ascii"),
                 "detail": "high",
             }},
+            # Put the Claude cache breakpoint AFTER the image so the model
+            # can reuse the visual prefix across subsequent function calls.
+            {"type": "text", "text": (
+                f"Visually inspect the task drawing at {path!r}{crop_label}. "
+                "Read spatial layout, annotations, and measurements directly. "
+                "If small text is not legible, say so rather than inventing it."
+            )},
         ],
     })
     return (
         f"image attached for the next model turn: {path} "
-        f"({mime}, {len(data)} bytes); interpret it visually"
+        f"({mime}, {len(data)} bytes{crop_label}); interpret it visually"
     )
 
   async def verify_file(self, path: str, file_format: str = "auto") -> str:
