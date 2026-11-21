@@ -1,0 +1,50 @@
+name: Verified PLE source sync
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: HTTPS URL of the vetted archive
+        required: true
+        type: string
+      source_sha256:
+        description: SHA256 of the vetted archive
+        required: true
+        type: string
+      source_commit:
+        description: Local source commit SHA
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify archive and sync allowed source files
+        shell: bash
+        env:
+          SOURCE_URL: ${{ inputs.source_url }}
+          EXPECTED_SHA: ${{ inputs.source_sha256 }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_URL" =~ ^https://tablemamori\.160-251-212-154\.sslip\.io/ple-sync-[a-f0-9]{20}/vetted-source\.tar\.gz$ ]] || exit 12
+          [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{64}$ ]] || exit 13
+          [[ "$SOURCE_COMMIT" =~ ^[a-f0-9]{7,40}$ ]] || exit 14
+          curl -fsSL --retry 3 --max-time 90 "$SOURCE_URL" -o /tmp/ple-source.tar.gz
+          printf '%s  %s\n' "$EXPECTED_SHA" /tmp/ple-source.tar.gz | sha256sum -c -
+          tar -tzf /tmp/ple-source.tar.gz | while IFS= read -r path; do
+            case "$path" in
+              README.md|COMPETITION.md|requirements.txt|serve.py|taskbridge.py|file_validation.py|constraint_check.py|tests/|tests/*.py) ;;
+              *) echo "Unexpected archive path: $path"; exit 15 ;;
+            esac
+          done
+          tar --no-same-owner --no-same-permissions -xzf /tmp/ple-source.tar.gz
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A README.md COMPETITION.md requirements.txt serve.py taskbridge.py file_validation.py constraint_check.py tests/
+          if git diff --cached --quiet; then echo "Source already current"; exit 0; fi
+          git commit -m "Sync verified Kaggle PLE source $SOURCE_COMMIT"
+          git push origin HEAD:main
